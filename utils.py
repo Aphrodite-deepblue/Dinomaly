@@ -344,7 +344,8 @@ def evaluation(model, dataloader, device, _class_=None, calc_pro=True, norm_fact
     return auroc_px, auroc_sp, round(np.mean(aupro_list), 4)
 
 
-def evaluation_batch(model, dataloader, device, _class_=None, max_ratio=0, resize_mask=None):
+def evaluation_batch(model, dataloader, device, _class_=None, max_ratio=0, resize_mask=None,
+                     show_progress=False, progress_desc=None, progress_leave=True):
     model.eval()
     gt_list_px = []
     pr_list_px = []
@@ -354,8 +355,15 @@ def evaluation_batch(model, dataloader, device, _class_=None, max_ratio=0, resiz
 
     starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
 
+    loader_iter = dataloader
+    batch_desc = progress_desc if progress_desc is not None else (_class_ if _class_ is not None else 'eval')
+    if show_progress:
+        from tqdm.auto import tqdm
+        loader_iter = tqdm(dataloader, desc='{} | batches'.format(batch_desc), leave=progress_leave,
+                           dynamic_ncols=True)
+
     with torch.no_grad():
-        for img, gt, label, img_path in dataloader:
+        for img, gt, label, img_path in loader_iter:
             img = img.to(device)
             # starter.record()
             output = model(img)
@@ -389,12 +397,24 @@ def evaluation_batch(model, dataloader, device, _class_=None, max_ratio=0, resiz
                 sp_score = sp_score.mean(dim=1)
             pr_list_sp.append(sp_score)
 
+        mbar = None
+        if show_progress:
+            from tqdm.auto import tqdm
+            mbar = tqdm(total=3, desc='{} | metrics'.format(batch_desc), leave=progress_leave,
+                        dynamic_ncols=True)
+
         gt_list_px = torch.cat(gt_list_px, dim=0)[:, 0].cpu().numpy()
         pr_list_px = torch.cat(pr_list_px, dim=0)[:, 0].cpu().numpy()
         gt_list_sp = torch.cat(gt_list_sp).flatten().cpu().numpy()
         pr_list_sp = torch.cat(pr_list_sp).flatten().cpu().numpy()
+        if mbar is not None:
+            mbar.set_postfix_str('pixel tensors')
+            mbar.update(1)
 
         aupro_px = compute_pro(gt_list_px, pr_list_px)
+        if mbar is not None:
+            mbar.set_postfix_str('AUPRO')
+            mbar.update(1)
 
         gt_list_px, pr_list_px = gt_list_px.ravel(), pr_list_px.ravel()
 
@@ -405,6 +425,10 @@ def evaluation_batch(model, dataloader, device, _class_=None, max_ratio=0, resiz
 
         f1_sp = f1_score_max(gt_list_sp, pr_list_sp)
         f1_px = f1_score_max(gt_list_px, pr_list_px)
+        if mbar is not None:
+            mbar.set_postfix_str('ROC/AP/F1')
+            mbar.update(1)
+            mbar.close()
 
     return [auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px]
 
@@ -516,15 +540,22 @@ def evaluation_uniad(model, dataloader, device, _class_=None, reg_calib=False, m
     return auroc_px, auroc_sp, ap_px, ap_sp, [gt_list_px, pr_list_px, gt_list_sp, pr_list_sp]
 
 
-def visualize(model, dataloader, device, _class_='None', save_name='save'):
+def visualize(model, dataloader, device, _class_='None', save_name='save',
+              show_progress=False, progress_desc=None, progress_leave=True):
     model.eval()
     save_dir = os.path.join('./visualize', save_name)
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     gaussian_kernel = get_gaussian_kernel(kernel_size=5, sigma=4).to(device)
 
+    loader_iter = dataloader
+    if show_progress:
+        from tqdm.auto import tqdm
+        desc = progress_desc if progress_desc is not None else 'heatmap {}'.format(_class_)
+        loader_iter = tqdm(dataloader, desc=str(desc), leave=progress_leave, dynamic_ncols=True)
+
     with torch.no_grad():
-        for img, gt, label, img_path in dataloader:
+        for img, gt, label, img_path in loader_iter:
             img = img.to(device)
             output = model(img)
             en, de = output[0], output[1]

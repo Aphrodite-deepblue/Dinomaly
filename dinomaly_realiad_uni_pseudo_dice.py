@@ -1,3 +1,6 @@
+# Real-IAD uni training with pseudo anomaly + Dice loss (full copy of dinomaly_realiad_uni.py).
+# Dice: only samples with gt_mask.sum()>0; per-map norm + sigmoid(x/dice_temp). See calculate_dice_loss.
+
 # This is a sample Python script.
 
 # Press ⌃R to execute it or replace it with your code.
@@ -5,8 +8,7 @@
 
 import torch
 import torch.nn as nn
-from dataset import get_data_transforms, get_strong_transforms
-from torchvision.datasets import ImageFolder
+from dataset_pseudo_dice import get_data_transforms, RealIADDataset, RealIADDatasetTrainWithPseudoMask
 import numpy as np
 import random
 import os
@@ -17,11 +19,10 @@ from models import vit_encoder
 from torch.nn.init import trunc_normal_
 from models.vision_transformer import Block as VitBlock, bMlp, Attention, LinearAttention, \
     LinearAttention2
-from dataset import MVTecDataset, RealIADDataset
 import torch.backends.cudnn as cudnn
 import argparse
 from utils import evaluation_batch, global_cosine_hm_percent, regional_cosine_focal, \
-    regional_cosine_hm, WarmCosineScheduler, visualize
+    regional_cosine_hm, WarmCosineScheduler, visualize, cal_anomaly_maps
 from torch.nn import functional as F
 from functools import partial
 from ptflops import get_model_complexity_info
@@ -38,6 +39,37 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
+
+
+def calculate_dice_loss(anomaly_map, gt_mask, temperature=0.1, smooth=1.0):
+    """
+    Dice only on samples with pseudo anomaly (gt_mask.sum() > 0).
+    Per-image standardization + temperature-scaled sigmoid before Dice (avoids empty-mask
+    degeneracy and cosine-scale / saturation issues).
+    anomaly_map: [B, 1, H, W]; gt_mask: [B, 1, H, W]
+    """
+    B = anomaly_map.size(0)
+    total = None
+    valid = 0
+    for i in range(B):
+        if gt_mask[i].sum() <= 0:
+            continue
+        p = anomaly_map[i : i + 1]
+        t = gt_mask[i : i + 1].float()
+        if t.shape[1] > 1:
+            t = torch.max(t, dim=1, keepdim=True)[0]
+        p_norm = (p - p.mean()) / (p.std() + 1e-8)
+        p_prob = torch.sigmoid(p_norm / temperature)
+        p_flat = p_prob.reshape(-1)
+        t_flat = t.reshape(-1)
+        inter = (p_flat * t_flat).sum()
+        dice = (2.0 * inter + smooth) / (p_flat.sum() + t_flat.sum() + smooth)
+        li = 1.0 - dice
+        total = li if total is None else total + li
+        valid += 1
+    if valid == 0:
+        return (anomaly_map * 0.0).sum()
+    return total / valid
 
 
 def get_logger(name, save_path=None, level='INFO'):
@@ -111,11 +143,15 @@ def train(item_list):
         # root_path = '/data/disk8T2/guoj/Real-IAD'
         root_path = args.data_path
 
-        train_data = RealIADDataset(root=root_path, category=item, transform=data_transform, gt_transform=gt_transform,
-                                    phase='train')
+        train_data = RealIADDatasetTrainWithPseudoMask(
+            root=root_path, category=item,
+            image_size=image_size, crop_size=crop_size,
+            pseudo_prob=args.pseudo_prob,
+            min_patch_ratio=args.pseudo_min_ratio,
+            max_patch_ratio=args.pseudo_max_ratio,
+        )
         train_data.classes = item
         train_data.class_to_idx = {item: i}
-        # train_data.samples = [(sample[0], i) for sample in train_data.samples]
 
         test_data = RealIADDataset(root=root_path, category=item, transform=data_transform, gt_transform=gt_transform,
                                    phase="test")
@@ -185,6 +221,8 @@ def train(item_list):
                                        warmup_iters=100)
 
     print_fn('train image number:{}'.format(len(train_data)))
+    print_fn('pseudo_prob={}, dice_alpha={}, dice_temp={}, pseudo_min/max={}/{}'.format(
+        args.pseudo_prob, args.dice_alpha, args.dice_temp, args.pseudo_min_ratio, args.pseudo_max_ratio))
     loss_history = []
 
     it = 0
@@ -197,16 +235,22 @@ def train(item_list):
         model.train()
 
         loss_list = []
-        for img, label in train_dataloader:
+        loss_recon_list = []
+        loss_dice_list = []
+        for img, label, gt_mask in train_dataloader:
             img = img.to(device)
             label = label.to(device)
+            gt_mask = gt_mask.to(device)
 
             en, de = model(img)
-            # loss = global_cosine(en, de)
 
             p_final = 0.9
             p = min(p_final * it / 1000, p_final)
-            loss = global_cosine_hm_percent(en, de, p=p, factor=0.1)
+            loss_recon = global_cosine_hm_percent(en, de, p=p, factor=0.1)
+
+            anomaly_map, _ = cal_anomaly_maps(en, de, img.shape[-1])
+            loss_dice = calculate_dice_loss(anomaly_map, gt_mask, temperature=args.dice_temp, smooth=1.0)
+            loss = loss_recon + args.dice_alpha * loss_dice
 
             optimizer.zero_grad()
             loss.backward()
@@ -214,6 +258,8 @@ def train(item_list):
 
             optimizer.step()
             loss_list.append(loss.item())
+            loss_recon_list.append(loss_recon.item())
+            loss_dice_list.append(loss_dice.item())
             loss_history.append(loss.item())
             lr_scheduler.step()
 
@@ -268,12 +314,20 @@ def train(item_list):
             if it % 20 == 0 and len(loss_list) > 0:
                 pbar.set_postfix(epoch='{}/{}'.format(epoch + 1, total_epochs), loss='{:.4f}'.format(np.mean(loss_list)))
 
+            if it % 100 == 0 or it == total_iters:
+                if len(loss_list) > 0:
+                    print_fn(
+                        'iter [{}/{}], loss_recon:{:.4f}, loss_dice:{:.4f}, loss:{:.4f} (dice_w*{:.2f}: {:.4f})'.format(
+                            it, total_iters,
+                            np.mean(loss_recon_list), np.mean(loss_dice_list), np.mean(loss_list),
+                            args.dice_alpha, args.dice_alpha * np.mean(loss_dice_list)))
+                if it % 100 == 0:
+                    loss_list = []
+                    loss_recon_list = []
+                    loss_dice_list = []
+
             if it == total_iters:
                 break
-
-            if it % 100 == 0:
-                print_fn('iter [{}/{}], loss:{:.4f}'.format(it, total_iters, np.mean(loss_list)))
-                loss_list = []
 
         if it == total_iters:
             break
@@ -297,8 +351,17 @@ if __name__ == '__main__':
     parser.add_argument('--data_path', type=str, default='/data/disk8T2/guoj/Real-IAD')
     parser.add_argument('--save_dir', type=str, default='./saved_results')
     parser.add_argument('--save_name', type=str,
-                        default='vitill_realiad_uni_dinov2br_c392r_en29_bn4dp4_de8_elaelu_l2g2_i1_it50k_sams2e3_wd1e4_w1hcosa2e4_ghmp09f01w01_b16_s1')
+                        default='vitill_realiad_uni_pseudo_dice_dinov2br_c392r_en29_bn4dp4_de8_it50k_b16')
     parser.add_argument('--vis_samples_per_class', type=int, default=64)
+    parser.add_argument('--pseudo_prob', type=float, default=0.5,
+                        help='per-sample prob of CutPaste or Gaussian pseudo anomaly (same as MVTEC pseudo_dice)')
+    parser.add_argument('--pseudo_min_ratio', type=float, default=0.05,
+                        help='min pseudo patch size ratio (larger = stabler Dice early)')
+    parser.add_argument('--pseudo_max_ratio', type=float, default=0.15)
+    parser.add_argument('--dice_alpha', type=float, default=0.1,
+                        help='loss = loss_recon + alpha * loss_dice')
+    parser.add_argument('--dice_temp', type=float, default=0.1,
+                        help='temperature in sigmoid after per-map norm: sharper maps when smaller')
     args = parser.parse_args()
     item_list = ['audiojack', 'bottle_cap', 'button_battery', 'end_cap', 'eraser', 'fire_hood',
                  'mint', 'mounts', 'pcb', 'phone_battery', 'plastic_nut', 'plastic_plug',

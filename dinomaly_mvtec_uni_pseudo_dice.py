@@ -5,23 +5,21 @@
 
 import torch
 import torch.nn as nn
-from dataset import get_data_transforms, get_strong_transforms
-from torchvision.datasets import ImageFolder
+from dataset_pseudo_dice import get_data_transforms, ImageFolderWithPseudoMask, MVTecDataset
 import numpy as np
 import random
 import os
-from torch.utils.data import DataLoader, ConcatDataset, Subset
+from torch.utils.data import DataLoader, ConcatDataset
 
 from models.uad import ViTill, ViTillv2
 from models import vit_encoder
-from torch.nn.init import trunc_normal_
+from dinov1.utils import trunc_normal_
 from models.vision_transformer import Block as VitBlock, bMlp, Attention, LinearAttention, \
-    LinearAttention2
-from dataset import MVTecDataset, RealIADDataset
+    LinearAttention2, ConvBlock, FeatureJitter
 import torch.backends.cudnn as cudnn
 import argparse
-from utils import evaluation_batch, global_cosine_hm_percent, regional_cosine_focal, \
-    regional_cosine_hm, WarmCosineScheduler, visualize
+from utils import evaluation_batch, global_cosine, regional_cosine_hm_percent, global_cosine_hm_percent, \
+    WarmCosineScheduler, cal_anomaly_maps
 from torch.nn import functional as F
 from functools import partial
 from ptflops import get_model_complexity_info
@@ -29,15 +27,28 @@ from optimizers import StableAdamW
 import warnings
 import copy
 import logging
-import sys
 from sklearn.metrics import roc_auc_score, average_precision_score
 import itertools
-from tqdm.auto import tqdm
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
+
+
+def dice_loss(pred_mask, gt_mask, smooth=1e-6):
+    """
+    Soft Dice loss for anomaly map supervision.
+    pred_mask: [B, 1, H, W] (differentiable anomaly scores, e.g. 1 - cosine similarity)
+    gt_mask:   [B, 1, H, W] float {0,1}
+    """
+    pred = torch.sigmoid(pred_mask)
+    gt = gt_mask.float()
+    if gt.shape[1] > 1:
+        gt = torch.max(gt, dim=1, keepdim=True)[0]
+    pred = pred.reshape(pred.size(0), -1)
+    gt = gt.reshape(gt.size(0), -1)
+    intersection = (pred * gt).sum(dim=1)
+    union = pred.sum(dim=1) + gt.sum(dim=1)
+    dice = (2.0 * intersection + smooth) / (union + smooth)
+    return 1.0 - dice.mean()
 
 
 def get_logger(name, save_path=None, level='INFO'):
@@ -58,15 +69,6 @@ def get_logger(name, save_path=None, level='INFO'):
     return logger
 
 
-def flush_logger(name):
-    """Ensure progress lines appear in screen/log immediately (avoids looking 'stuck')."""
-    for h in logging.getLogger(name).handlers:
-        if hasattr(h, 'flush'):
-            h.flush()
-    sys.stdout.flush()
-    sys.stderr.flush()
-
-
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -76,49 +78,40 @@ def setup_seed(seed):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-    torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True
-
-
-def save_loss_curve(loss_history, save_path):
-    if len(loss_history) == 0:
-        return
-
-    plt.figure(figsize=(10, 4))
-    plt.plot(np.arange(1, len(loss_history) + 1), loss_history, linewidth=1.0)
-    plt.xlabel('Iteration')
-    plt.ylabel('Loss')
-    plt.title('Training Loss')
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=200)
-    plt.close()
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def train(item_list):
     setup_seed(1)
 
-    total_iters = 50000
+    total_iters = 10000
     batch_size = 16
     image_size = 448
     crop_size = 392
+
+    # image_size = 448
+    # crop_size = 448
 
     data_transform, gt_transform = get_data_transforms(image_size, crop_size)
 
     train_data_list = []
     test_data_list = []
     for i, item in enumerate(item_list):
-        # root_path = '/data/disk8T2/guoj/Real-IAD'
-        root_path = args.data_path
+        train_path = os.path.join(args.data_path, item, 'train')
+        test_path = os.path.join(args.data_path, item)
 
-        train_data = RealIADDataset(root=root_path, category=item, transform=data_transform, gt_transform=gt_transform,
-                                    phase='train')
-        train_data.classes = item
-        train_data.class_to_idx = {item: i}
-        # train_data.samples = [(sample[0], i) for sample in train_data.samples]
+        train_data = ImageFolderWithPseudoMask(
+            root=train_path,
+            class_label_idx=i,
+            image_size=image_size,
+            crop_size=crop_size,
+            pseudo_prob=args.pseudo_prob,
+            min_patch_ratio=args.pseudo_min_ratio,
+            max_patch_ratio=args.pseudo_max_ratio,
+        )
 
-        test_data = RealIADDataset(root=root_path, category=item, transform=data_transform, gt_transform=gt_transform,
-                                   phase="test")
+        test_data = MVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test")
         train_data_list.append(train_data)
         test_data_list.append(test_data)
 
@@ -131,6 +124,15 @@ def train(item_list):
     # encoder_name = 'dinov2reg_vit_small_14'
     encoder_name = 'dinov2reg_vit_base_14'
     # encoder_name = 'dinov2reg_vit_large_14'
+
+    # encoder_name = 'dinov2_vit_base_14'
+    # encoder_name = 'dino_vit_base_16'
+    # encoder_name = 'ibot_vit_base_16'
+    # encoder_name = 'mae_vit_base_16'
+    # encoder_name = 'beitv2_vit_base_16'
+    # encoder_name = 'beit_vit_base_16'
+    # encoder_name = 'digpt_vit_base_16'
+    # encoder_name = 'deit_vit_base_16'
 
     target_layers = [2, 3, 4, 5, 6, 7, 8, 9]
     fuse_layer_encoder = [[0, 1, 2, 3], [4, 5, 6, 7]]
@@ -153,13 +155,17 @@ def train(item_list):
     bottleneck = []
     decoder = []
 
-    bottleneck.append(bMlp(embed_dim, embed_dim * 4, embed_dim, drop=0.4))
+    bottleneck.append(bMlp(embed_dim, embed_dim * 4, embed_dim, drop=0.2))
+    # bottleneck.append(nn.Sequential(FeatureJitter(scale=40),
+    #                                 bMlp(embed_dim, embed_dim * 4, embed_dim, drop=0.)))
+
     bottleneck = nn.ModuleList(bottleneck)
 
     for i in range(8):
         blk = VitBlock(dim=embed_dim, num_heads=num_heads, mlp_ratio=4.,
-                       qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-8), attn_drop=0.,
+                       qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-8),
                        attn=LinearAttention2)
+        # blk = ConvBlock(dim=embed_dim, kernel_size=7, mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-8))
         decoder.append(blk)
     decoder = nn.ModuleList(decoder)
 
@@ -170,9 +176,7 @@ def train(item_list):
 
     for m in trainable.modules():
         if isinstance(m, nn.Linear):
-            tmp_weight = m.weight.detach().cpu()
-            trunc_normal_(tmp_weight, std=0.01, a=-0.03, b=0.03)
-            m.weight.data.copy_(tmp_weight.to(m.weight.device))
+            trunc_normal_(m.weight, std=0.01, a=-0.03, b=0.03)
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
@@ -185,28 +189,27 @@ def train(item_list):
                                        warmup_iters=100)
 
     print_fn('train image number:{}'.format(len(train_data)))
-    loss_history = []
+    print_fn('pseudo_prob={}, dice_alpha={}'.format(args.pseudo_prob, args.dice_alpha))
 
     it = 0
-    iters_per_epoch = len(train_dataloader)
-    total_epochs = int(np.ceil(total_iters / iters_per_epoch))
-    print_fn('total_iters:{}, iters_per_epoch:{}, approx_epochs:{}'.format(total_iters, iters_per_epoch, total_epochs))
-    pbar = tqdm(total=total_iters, desc='train', dynamic_ncols=True)
-
-    for epoch in range(total_epochs):
+    for epoch in range(int(np.ceil(total_iters / len(train_dataloader)))):
         model.train()
 
         loss_list = []
-        for img, label in train_dataloader:
+        for img, label, gt_mask in train_dataloader:
             img = img.to(device)
             label = label.to(device)
+            gt_mask = gt_mask.to(device)
 
             en, de = model(img)
-            # loss = global_cosine(en, de)
 
             p_final = 0.9
             p = min(p_final * it / 1000, p_final)
-            loss = global_cosine_hm_percent(en, de, p=p, factor=0.1)
+            loss_recon = global_cosine_hm_percent(en, de, p=p, factor=0.1)
+
+            anomaly_map, _ = cal_anomaly_maps(en, de, img.shape[-1])
+            loss_dice = dice_loss(anomaly_map, gt_mask)
+            loss = loss_recon + args.dice_alpha * loss_dice
 
             optimizer.zero_grad()
             loss.backward()
@@ -214,21 +217,17 @@ def train(item_list):
 
             optimizer.step()
             loss_list.append(loss.item())
-            loss_history.append(loss.item())
             lr_scheduler.step()
 
-            if (it + 1) % 50000 == 0:
-                torch.save(model.state_dict(), os.path.join(args.save_dir, args.save_name, 'model.pth'))
-                print_fn('[eval] full test on {} classes (num_workers=0 to avoid dataloader hangs); first log may take long on large sets.'.format(len(item_list)))
-                flush_logger(args.save_name)
+            if (it + 1) % 5000 == 0:
+                # torch.save(model.state_dict(), os.path.join(args.save_dir, args.save_name, 'model.pth'))
+
                 auroc_sp_list, ap_sp_list, f1_sp_list = [], [], []
                 auroc_px_list, ap_px_list, f1_px_list, aupro_px_list = [], [], [], []
+
                 for item, test_data in zip(item_list, test_data_list):
-                    print_fn('[eval] {} — start ({} test images, metrics print right after inference)'.format(item, len(test_data)))
-                    flush_logger(args.save_name)
-                    # num_workers=0: long runs + CUDA often deadlock with forked workers; also no tqdm here so it looks "stuck".
                     test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=batch_size, shuffle=False,
-                                                                   num_workers=0, pin_memory=False)
+                                                                  num_workers=4)
                     results = evaluation_batch(model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
                     auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px = results
 
@@ -243,46 +242,18 @@ def train(item_list):
                     print_fn(
                         '{}: I-Auroc:{:.4f}, I-AP:{:.4f}, I-F1:{:.4f}, P-AUROC:{:.4f}, P-AP:{:.4f}, P-F1:{:.4f}, P-AUPRO:{:.4f}'.format(
                             item, auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px))
-                    flush_logger(args.save_name)
 
-                    if args.vis_samples_per_class > 0 and len(test_data) > 0:
-                        print_fn('[eval] {} — saving heatmaps ({} samples)...'.format(item, min(args.vis_samples_per_class, len(test_data))))
-                        flush_logger(args.save_name)
-                        vis_count = min(args.vis_samples_per_class, len(test_data))
-                        vis_indices = np.linspace(0, len(test_data) - 1, num=vis_count, dtype=int).tolist()
-                        vis_subset = Subset(test_data, vis_indices)
-                        vis_dataloader = torch.utils.data.DataLoader(vis_subset, batch_size=batch_size, shuffle=False,
-                                                                      num_workers=0, pin_memory=False)
-                        visualize(model, vis_dataloader, device, _class_=item,
-                                  save_name=os.path.join(args.save_name, 'heatmap'))
-                        flush_logger(args.save_name)
                 print_fn(
                     'Mean: I-Auroc:{:.4f}, I-AP:{:.4f}, I-F1:{:.4f}, P-AUROC:{:.4f}, P-AP:{:.4f}, P-F1:{:.4f}, P-AUPRO:{:.4f}'.format(
                         np.mean(auroc_sp_list), np.mean(ap_sp_list), np.mean(f1_sp_list),
                         np.mean(auroc_px_list), np.mean(ap_px_list), np.mean(f1_px_list), np.mean(aupro_px_list)))
+
                 model.train()
 
             it += 1
-            pbar.update(1)
-
-            if it % 20 == 0 and len(loss_list) > 0:
-                pbar.set_postfix(epoch='{}/{}'.format(epoch + 1, total_epochs), loss='{:.4f}'.format(np.mean(loss_list)))
-
             if it == total_iters:
                 break
-
-            if it % 100 == 0:
-                print_fn('iter [{}/{}], loss:{:.4f}'.format(it, total_iters, np.mean(loss_list)))
-                loss_list = []
-
-        if it == total_iters:
-            break
-
-    pbar.close()
-    loss_plot_path = os.path.join(args.save_dir, args.save_name, 'loss_curve.png')
-    save_loss_curve(loss_history, loss_plot_path)
-    print_fn('loss curve saved to {}'.format(loss_plot_path))
-    print_fn('heatmaps saved under {}'.format(os.path.join('./visualize', args.save_name, 'heatmap')))
+        print_fn('iter [{}/{}], loss:{:.4f}'.format(it, total_iters, np.mean(loss_list)))
 
     # torch.save(model.state_dict(), os.path.join(args.save_dir, args.save_name, 'model.pth'))
 
@@ -294,21 +265,22 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description='')
-    parser.add_argument('--data_path', type=str, default='/data/disk8T2/guoj/Real-IAD')
+    parser.add_argument('--data_path', type=str, default='../mvtec_anomaly_detection')
     parser.add_argument('--save_dir', type=str, default='./saved_results')
     parser.add_argument('--save_name', type=str,
-                        default='vitill_realiad_uni_dinov2br_c392r_en29_bn4dp4_de8_elaelu_l2g2_i1_it50k_sams2e3_wd1e4_w1hcosa2e4_ghmp09f01w01_b16_s1')
-    parser.add_argument('--vis_samples_per_class', type=int, default=64)
+                        default='vitill_mvtec_uni_pseudo_dice_dinov2br_c392_en29_bn4dp2_de8_it10k_b16')
+    parser.add_argument('--pseudo_prob', type=float, default=0.5,
+                        help='probability of injecting CutPaste or Gaussian-noise pseudo anomaly per sample')
+    parser.add_argument('--pseudo_min_ratio', type=float, default=0.02)
+    parser.add_argument('--pseudo_max_ratio', type=float, default=0.15)
+    parser.add_argument('--dice_alpha', type=float, default=0.5, help='weight for Dice loss: loss_recon + alpha * loss_dice')
     args = parser.parse_args()
-    item_list = ['audiojack', 'bottle_cap', 'button_battery', 'end_cap', 'eraser', 'fire_hood',
-                 'mint', 'mounts', 'pcb', 'phone_battery', 'plastic_nut', 'plastic_plug',
-                 'porcelain_doll', 'regulator', 'rolled_strip_base', 'sim_card_set', 'switch', 'tape',
-                 'terminalblock', 'toothbrush', 'toy', 'toy_brick', 'transistor1', 'usb',
-                 'usb_adaptor', 'u_block', 'vcpill', 'wooden_beads', 'woodstick', 'zipper']
+    #
+    item_list = ['carpet', 'grid', 'leather', 'tile', 'wood', 'bottle', 'cable', 'capsule',
+                 'hazelnut', 'metal_nut', 'pill', 'screw', 'toothbrush', 'transistor', 'zipper']
     logger = get_logger(args.save_name, os.path.join(args.save_dir, args.save_name))
     print_fn = logger.info
 
-    # Use the first visible CUDA device by default to avoid invalid ordinal errors.
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     print_fn(device)
 

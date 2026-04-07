@@ -30,3 +30,4 @@ bin/
 .DS_Store
 .ipynb_checkpoints/
 *.log
+visualize/

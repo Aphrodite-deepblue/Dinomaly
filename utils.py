@@ -679,7 +679,8 @@ def visualize_loco(model, dataloader, device, _class_='None', save_name='save'):
     return
 
 
-def compute_pro(masks: ndarray, amaps: ndarray, num_th: int = 200) -> None:
+def compute_pro(masks: ndarray, amaps: ndarray, num_th: int = 200,
+                show_progress: bool = False, progress_desc: str = "AUPRO") -> None:
     """Compute the area under the curve of per-region overlaping (PRO) and 0 to 0.3 FPR
     Args:
         category (str): Category of product
@@ -703,7 +704,12 @@ def compute_pro(masks: ndarray, amaps: ndarray, num_th: int = 200) -> None:
     max_th = amaps.max()
     delta = (max_th - min_th) / num_th
 
-    for th in np.arange(min_th, max_th, delta):
+    thresholds = np.arange(min_th, max_th, delta)
+    if show_progress:
+        from tqdm.auto import tqdm
+        thresholds = tqdm(thresholds, desc=progress_desc, dynamic_ncols=True, leave=False)
+
+    for th in thresholds:
         binary_amaps[amaps <= th] = 0
         binary_amaps[amaps > th] = 1
 
